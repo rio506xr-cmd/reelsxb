@@ -1,7 +1,7 @@
+
 {
   "name": "sxb-soundcloud-bot",
   "version": "1.0.0",
-  "private": true,
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -9,6 +9,7 @@
   "dependencies": {
     "@discordjs/voice": "^0.19.0",
     "discord.js": "^14.19.3",
-    "dotenv": "^16.4.7"
+    "dotenv": "^16.4.7",
+    "opusscript": "^0.0.8"
   }
 }
