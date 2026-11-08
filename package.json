@@ -1,20 +1,14 @@
-
 {
-  "name": "discord-music-multi-bot",
+  "name": "sxb-soundcloud-bot",
   "version": "1.0.0",
-  "description": "Discord Music Bot",
+  "private": true,
   "main": "index.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
-  "engines": {
-    "node": ">=22.12.0"
-  },
   "dependencies": {
-    "@discordjs/opus": "^0.10.0",
-    "@discordjs/voice": "0.19.2",
-    "@snazzah/davey": "0.1.12",
-    "discord.js": "14.28.1"
+    "@discordjs/voice": "^0.19.0",
+    "discord.js": "^14.19.3",
+    "dotenv": "^16.4.7"
   }
 }

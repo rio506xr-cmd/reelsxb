@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: sxb-soundcloud-bot
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: TOKEN
+        sync: false
+      - key: CLIENT_ID
+        sync: false
+      - key: GUILD_ID
+        sync: false
