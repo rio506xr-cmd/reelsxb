@@ -29,7 +29,7 @@ const {
 
 // ضع هنا ID الروم الصوتي. البوت يدخل هذا الروم تلقائياً عند التشغيل.
 // مثال: const VOICE_CHANNEL_ID = '123456789012345678';
-const VOICE_CHANNEL_ID = '1567744230418284554';
+const VOICE_CHANNEL_ID = 'PUT_YOUR_VOICE_CHANNEL_ID_HERE';
 
 const MAX_QUEUE = Math.max(1, Number(process.env.MAX_QUEUE || 50));
 const YTDLP_PATH = process.env.YTDLP_PATH || (process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
@@ -231,10 +231,10 @@ async function updatePanel(state) {
 function runYtDlp(inputUrl) {
   return new Promise((resolve, reject) => {
     const args = [
+      '--ignore-config',
       '--no-warnings',
       '--no-progress',
       '--no-playlist',
-      '--no-call-home',
       '--socket-timeout', '20',
       '--extractor-retries', '2',
       '--fragment-retries', '2',
@@ -283,6 +283,12 @@ function runYtDlp(inputUrl) {
     child.once('close', (code) => {
       if (settled) return;
       if (code !== 0) {
+        if (/DRM protected|cbc-encrypted-hls|ctr-encrypted-hls/i.test(stderr)) {
+          finish(new Error(
+            'هذا المقطع من SoundCloud محمي بـ DRM، وyt-dlp ما يدعم تشغيل هذا النوع. جرّب رابطاً آخر لنفس الأغنية من مصدر غير محمي أو نسخة متاحة للبث.'
+          ));
+          return;
+        }
         const detail = clip(stderr || `exit code ${code}`, 700);
         finish(new Error(`yt-dlp ما قدر يستخرج الرابط: ${detail}`));
         return;
