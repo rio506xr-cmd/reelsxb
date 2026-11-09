@@ -1,13 +1,12 @@
 services:
-  - type: worker
-    name: sxb-soundcloud-bot
-    runtime: docker
-    plan: starter
-    dockerfilePath: ./Dockerfile
+  - type: web
+    name: discord-music-bot
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    maxShutdownDelaySeconds: 60
     envVars:
-      - key: TOKEN
-        sync: false
-      - key: CLIENT_ID
-        sync: false
-      - key: GUILD_ID
+      - key: DISCORD_TOKEN
         sync: false
