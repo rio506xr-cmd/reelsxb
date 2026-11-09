@@ -1,435 +1,1511 @@
-import { createServer } from 'node:http';
-import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
-import path from 'node:path';
-import { URL } from 'node:url';
-import ffmpegPath from 'ffmpeg-static';
 import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  ChannelType,
   Client,
   EmbedBuilder,
   Events,
   GatewayIntentBits,
-  REST,
-  Routes,
   SlashCommandBuilder,
+  PermissionFlagsBits,
 } from 'discord.js';
+
 import {
   AudioPlayerStatus,
-  NoSubscriberBehavior,
-  StreamType,
   VoiceConnectionStatus,
+  StreamType,
+  NoSubscriberBehavior,
   createAudioPlayer,
   createAudioResource,
   entersState,
-  getVoiceConnection,
   joinVoiceChannel,
 } from '@discordjs/voice';
 
-// ============================================================
-// الإعداد الوحيد الذي تعدّله داخل الكود: آيدي روم الصوت.
-// التوكن لا تضعه هنا؛ ضعه في Render باسم DISCORD_TOKEN.
-// لا يوجد TEXT_CHANNEL_ID أو GUILD_ID.
-// ============================================================
-const VOICE_CHANNEL_ID = '1567744230418284554';
+import { createServer } from 'node:http';
+import { randomUUID } from 'node:crypto';
+import path from 'node:path';
 
-const TOKEN = process.env.DISCORD_TOKEN?.trim();
+import ytdlp from 'youtube-dl-exec';
+import ffmpegPath from 'ffmpeg-static';
+
+// ========================================
+// الإعدادات
+// ========================================
+
+// ضع آيدي روم الصوت هنا
+const VOICE_CHANNEL_ID = 'PUT_VOICE_CHANNEL_ID_HERE';
+
+// التوكن من Render
+// يدعم TOKEN و DISCORD_TOKEN
+const TOKEN = process.env.DISCORD_TOKEN || process.env.TOKEN;
+
 const PORT = Number(process.env.PORT || 10000);
-const DEFAULT_VOLUME = 0.5; // من 0.0 إلى 1.0
-const MAX_QUEUE_SIZE = 50;
-const MAX_PANELS = 30;
 
-if (!TOKEN) throw new Error('أضف DISCORD_TOKEN في Render Environment Variables.');
-if (!/^\d{17,20}$/.test(VOICE_CHANNEL_ID)) {
-  throw new Error('ضع آيدي روم الصوت الصحيح مكان PUT_VOICE_CHANNEL_ID_HERE في أعلى index.js.');
+const MAX_QUEUE = 50;
+const METADATA_TIMEOUT_MS = 45000;
+const PREVIEW_TTL_MS = 10 * 60 * 1000;
+
+if (!TOKEN) {
+  throw new Error('أضف TOKEN أو DISCORD_TOKEN في Render.');
 }
-if (!ffmpegPath) throw new Error('لم يتم العثور على FFmpeg. تحقق من تثبيت ffmpeg-static.');
-if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) throw new Error('PORT غير صالح.');
+
+if (!/^\d{17,20}$/.test(VOICE_CHANNEL_ID)) {
+  throw new Error('ضع آيدي روم الصوت الصحيح في index.js.');
+}
+
+// إضافة FFmpeg إلى PATH
+if (ffmpegPath) {
+  process.env.PATH =
+    `${path.dirname(ffmpegPath)}${path.delimiter}${process.env.PATH || ''}`;
+}
+
+// ========================================
+// Discord Client
+// ========================================
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildVoiceStates,
+  ],
 });
 
-let music;
-let ready = false;
+const states = new Map();
+const previews = new Map();
 
-// خادم HTTP مطلوب لـ Render Web Service.
-const server = createServer((req, res) => {
-  const pathname = new URL(req.url || '/', 'http://localhost').pathname;
-  if (req.method !== 'GET' && req.method !== 'HEAD') {
-    res.writeHead(405, { Allow: 'GET, HEAD', 'Content-Type': 'text/plain; charset=utf-8' });
-    return res.end(req.method === 'HEAD' ? undefined : 'Method Not Allowed');
-  }
-  if (pathname !== '/' && pathname !== '/health') {
-    res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
-    return res.end(req.method === 'HEAD' ? undefined : JSON.stringify({ ok: false }));
-  }
-  const body = JSON.stringify({
-    ok: true,
-    service: 'discord-music-bot',
-    discord: client.isReady() ? 'ready' : 'connecting',
-    voice: ready ? 'connected-or-started' : 'starting',
-    uptime: Math.floor(process.uptime()),
-  });
-  res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
-  res.end(req.method === 'HEAD' ? undefined : body);
-});
-server.listen(PORT, '0.0.0.0', () => console.log(`Web Service listening on 0.0.0.0:${PORT}`));
+let configuredGuildId = null;
 
-function safeText(value, max = 180) {
-  return String(value ?? '')
-    .replace(/[`*_~|>]/g, '')
-    .replace(/@/g, '@\u200b')
+// ========================================
+// نظام الموسيقى
+// ========================================
+
+function getState(guildId) {
+  if (!states.has(guildId)) {
+
+    const player = createAudioPlayer({
+      behaviors: {
+        noSubscriber: NoSubscriberBehavior.Pause,
+      },
+    });
+
+    const state = {
+      guildId,
+      player,
+      connection: null,
+
+      queue: [],
+      current: null,
+
+      process: null,
+      preparing: false,
+
+      panelMessage: null,
+      lastStderr: '',
+    };
+
+    // عند انتهاء الأغنية
+    player.on(AudioPlayerStatus.Idle, () => {
+
+      state.current = null;
+      state.process = null;
+      state.preparing = false;
+
+      void refreshPanel(state);
+      void playNext(state);
+    });
+
+    // معالجة أخطاء الصوت
+    player.on('error', (error) => {
+
+      console.error('[PLAYER ERROR]', error);
+
+      state.current = null;
+      state.preparing = false;
+
+      stopYtDlp(state);
+
+      void refreshPanel(state);
+
+      setTimeout(() => {
+        void playNext(state);
+      }, 800).unref?.();
+    });
+
+    states.set(guildId, state);
+  }
+
+  return states.get(guildId);
+}
+
+// ========================================
+// أدوات مساعدة
+// ========================================
+
+function formatDuration(seconds) {
+
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    return 'غير معروف';
+  }
+
+  const total = Math.floor(seconds);
+
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+
+  return h > 0
+    ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+    : `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function cleanText(value, max = 180) {
+
+  return String(value || 'غير معروف')
     .replace(/[\r\n]+/g, ' ')
-    .slice(0, max) || 'مقطع صوتي';
+    .slice(0, max);
 }
 
-function getTrackTitle(rawUrl, customTitle) {
-  if (customTitle?.trim()) return safeText(customTitle.trim());
-  const url = new URL(rawUrl);
-  const fileName = path.posix.basename(url.pathname).replace(/\.[a-z0-9]{2,5}$/i, '');
-  return safeText(decodeURIComponent(fileName || url.hostname));
+// ========================================
+// تصميم بطاقة الأغنية
+// ========================================
+
+function buildTrackEmbed(track, statusText = 'معاينة الأغنية') {
+
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle(cleanText(track.title, 240))
+    .setURL(track.webpageUrl)
+    .setDescription(
+      `**الفنان:** ${cleanText(track.artist)}\n` +
+      `**المدة:** ${formatDuration(track.duration)}\n` +
+      `**الحالة:** ${statusText}`
+    )
+    .setFooter({
+      text: 'Music Player • yt-dlp',
+    });
+
+  if (track.thumbnail && /^https?:\/\//i.test(track.thumbnail)) {
+    embed.setThumbnail(track.thumbnail);
+  }
+
+  return embed;
 }
 
-function validateAudioUrl(raw) {
-  let url;
-  try { url = new URL(raw); } catch { throw new Error('الرابط غير صحيح. أرسل رابط HTTPS كاملاً.'); }
-  if (url.protocol !== 'https:') throw new Error('يجب أن يبدأ الرابط بـ https://');
-  if (url.username || url.password) throw new Error('الروابط التي تتضمن بيانات دخول غير مدعومة.');
-  const host = url.hostname.toLowerCase();
-  if (
-    host === 'soundcloud.com' || host.endsWith('.soundcloud.com') ||
-    host === 'snd.sc' || host.endsWith('.snd.sc') ||
-    host === 'sndcdn.com' || host.endsWith('.sndcdn.com')
-  ) {
-    throw new Error('رابط صفحة SoundCloud غير مدعوم. أرسل رابط بث صوتي مباشر ومصرّح بتشغيله بدلاً منه.');
+// ========================================
+// بطاقة قائمة التشغيل
+// ========================================
+
+function buildQueueEmbed(state) {
+
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle('🎶 قائمة التشغيل')
+    .setDescription(
+      state.current
+        ? `**يعمل الآن:** [${cleanText(state.current.title, 100)}](${state.current.webpageUrl})\n\n`
+        : 'لا توجد أغنية قيد التشغيل حالياً.\n\n'
+    );
+
+  if (state.queue.length) {
+
+    const upcoming = state.queue
+      .slice(0, 10)
+      .map((track, index) =>
+        `**${index + 1}.** [${cleanText(track.title, 90)}](${track.webpageUrl}) — ${formatDuration(track.duration)}`
+      );
+
+    embed.addFields({
+      name: `القادم (${state.queue.length})`,
+      value: upcoming.join('\n').slice(0, 1024),
+    });
+
+  } else {
+
+    embed.addFields({
+      name: 'القادم',
+      value: 'القائمة فارغة.',
+    });
   }
-  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) {
-    throw new Error('هذا المضيف غير مسموح.');
-  }
-  if (/^(127\.|10\.|192\.168\.|169\.254\.)/.test(host) || /^172\.(1[6-9]|2\d|3[01])\./.test(host) || host === '::1') {
-    throw new Error('لا يمكن تشغيل رابط يشير إلى عنوان محلي أو خاص.');
-  }
-  const audioExtension = /\.(mp3|m4a|aac|wav|ogg|oga|opus|flac)(?:$|\/)/i.test(url.pathname);
-  if (!audioExtension) {
-    throw new Error('أرسل رابط ملف صوتي مباشر بامتداد MP3 أو M4A أو AAC أو WAV أو OGG أو OPUS أو FLAC.');
-  }
-  return url.toString();
+
+  return embed;
 }
 
-function createMusicState(guild, voiceChannel) {
-  const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } });
-  const state = {
-    guildId: guild.id,
-    guild,
-    voiceChannelId: voiceChannel.id,
-    player,
-    connection: null,
-    queue: [],
-    current: null,
-    panels: new Map(),
-    ffmpeg: null,
-    advancing: false,
+// ========================================
+// أزرار التحكم
+// ========================================
+
+function controlRow(state) {
+
+  const paused =
+    state.player.state.status === AudioPlayerStatus.Paused;
+
+  return new ActionRowBuilder().addComponents(
+
+    new ButtonBuilder()
+      .setCustomId('music:toggle')
+      .setLabel(paused ? 'استئناف' : 'إيقاف مؤقت')
+      .setEmoji(paused ? '▶️' : '⏸️')
+      .setStyle(ButtonStyle.Primary),
+
+    new ButtonBuilder()
+      .setCustomId('music:skip')
+      .setLabel('تخطي')
+      .setEmoji('⏭️')
+      .setStyle(ButtonStyle.Secondary),
+
+    new ButtonBuilder()
+      .setCustomId('music:queue')
+      .setLabel('القائمة')
+      .setEmoji('📃')
+      .setStyle(ButtonStyle.Secondary),
+
+    new ButtonBuilder()
+      .setCustomId('music:stop')
+      .setLabel('إيقاف')
+      .setEmoji('⏹️')
+      .setStyle(ButtonStyle.Danger),
+
+  );
+}
+
+// ========================================
+// تحديث لوحة التحكم
+// ========================================
+
+async function refreshPanel(state) {
+
+  if (!state.panelMessage) return;
+
+  try {
+
+    const embed = state.current
+      ? buildTrackEmbed(
+          state.current,
+          state.player.state.status === AudioPlayerStatus.Paused
+            ? 'متوقفة مؤقتاً'
+            : 'قيد التشغيل'
+        )
+      : buildQueueEmbed(state);
+
+    await state.panelMessage.edit({
+      embeds: [embed],
+      components: [controlRow(state)],
+    });
+
+  } catch (error) {
+
+    if (error?.code !== 10008) {
+      console.error('[PANEL UPDATE]', error.message);
+    }
+
+    state.panelMessage = null;
+  }
+}
+
+// ========================================
+// إيقاف عملية yt-dlp
+// ========================================
+
+function stopYtDlp(state) {
+
+  const child = state.process;
+
+  state.process = null;
+
+  if (child && child.exitCode === null && !child.killed) {
+
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      // انتهت العملية بالفعل
+    }
+  }
+}
+
+// ========================================
+// قراءة بيانات الأغنية باستخدام yt-dlp
+// ========================================
+
+function runYtDlpForJson(url) {
+
+  return new Promise((resolve, reject) => {
+
+    const child = ytdlp.exec(url, {
+
+      dumpSingleJson: true,
+      skipDownload: true,
+      noPlaylist: true,
+      noWarnings: true,
+      quiet: true,
+
+      socketTimeout: 20,
+      retries: 1,
+
+    });
+
+    const stdout = [];
+    const stderr = [];
+
+    let settled = false;
+
+    const timer = setTimeout(() => {
+
+      if (!settled) {
+
+        settled = true;
+
+        child.kill('SIGKILL');
+
+        reject(
+          new Error('انتهت مهلة قراءة بيانات الأغنية.')
+        );
+      }
+
+    }, METADATA_TIMEOUT_MS);
+
+    timer.unref?.();
+
+    child.stdout?.on('data', (chunk) => {
+      stdout.push(Buffer.from(chunk));
+    });
+
+    child.stderr?.on('data', (chunk) => {
+
+      stderr.push(Buffer.from(chunk));
+
+      while (
+        stderr.reduce((size, part) => size + part.length, 0) > 12000
+      ) {
+        stderr.shift();
+      }
+    });
+
+    child.once('error', (error) => {
+
+      if (settled) return;
+
+      settled = true;
+
+      clearTimeout(timer);
+
+      reject(error);
+    });
+
+    child.once('close', (code) => {
+
+      if (settled) return;
+
+      settled = true;
+
+      clearTimeout(timer);
+
+      const output = Buffer
+        .concat(stdout)
+        .toString('utf8')
+        .trim();
+
+      if (code !== 0 || !output) {
+
+        const details = Buffer
+          .concat(stderr)
+          .toString('utf8')
+          .trim()
+          .slice(-1200);
+
+        reject(
+          new Error(details || `yt-dlp انتهى برمز ${code}.`)
+        );
+
+        return;
+      }
+
+      try {
+
+        resolve(JSON.parse(output));
+
+      } catch {
+
+        reject(
+          new Error('تعذر قراءة بيانات الأغنية من yt-dlp.')
+        );
+      }
+    });
+  });
+}
+
+// ========================================
+// التحقق من الرابط
+// ========================================
+
+function validateHttpUrl(rawUrl) {
+
+  let parsed;
+
+  try {
+
+    parsed = new URL(rawUrl.trim());
+
+  } catch {
+
+    throw new Error(
+      'الرابط غير صحيح. أرسل رابطاً كاملاً يبدأ بـ https://'
+    );
+  }
+
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+
+    throw new Error(
+      'المسموح روابط HTTP أو HTTPS فقط.'
+    );
+  }
+
+  return parsed.toString();
+}
+
+// ========================================
+// استخراج معلومات الأغنية
+// ========================================
+
+async function getTrackInfo(rawUrl, requesterId) {
+
+  const url = validateHttpUrl(rawUrl);
+
+  const info = await runYtDlpForJson(url);
+
+  const entry = Array.isArray(info.entries)
+    ? info.entries.find(Boolean)
+    : info;
+
+  if (!entry) {
+
+    throw new Error(
+      'لم أجد مقطعاً قابلاً للتشغيل في هذا الرابط.'
+    );
+  }
+
+  const pageUrl =
+    entry.webpage_url ||
+    entry.original_url ||
+    url;
+
+  return {
+
+    id: String(entry.id || randomUUID()),
+
+    title: cleanText(
+      entry.title || 'بدون عنوان',
+      240
+    ),
+
+    artist: cleanText(
+      entry.artist ||
+      entry.uploader ||
+      entry.channel ||
+      'غير معروف',
+      180
+    ),
+
+    duration: Number.isFinite(Number(entry.duration))
+      ? Number(entry.duration)
+      : null,
+
+    thumbnail:
+      entry.thumbnail ||
+      entry.thumbnails?.at(-1)?.url ||
+      null,
+
+    webpageUrl: pageUrl,
+    url: pageUrl,
+
+    requesterId,
   };
+}
 
-  player.on(AudioPlayerStatus.Idle, () => {
-    stopFfmpeg(state);
-    state.current = null;
-    void playNext(state);
-    void refreshPanels(state);
+// ========================================
+// تشغيل الأغنية باستخدام yt-dlp
+// ========================================
+
+function launchYtDlpStream(state, track) {
+
+  const child = ytdlp.exec(track.url, {
+
+    format: 'bestaudio/best',
+    output: '-',
+
+    noPlaylist: true,
+    quiet: true,
+    noWarnings: true,
+    noProgress: true,
+
+    socketTimeout: 20,
+    retries: 2,
+    fragmentRetries: 2,
+
   });
-  player.on('error', error => {
-    console.error('Audio player error:', error);
-    stopFfmpeg(state);
-    state.current = null;
-    void playNext(state);
-    void refreshPanels(state);
+
+  state.process = child;
+  state.lastStderr = '';
+
+  child.stderr?.on('data', (chunk) => {
+
+    state.lastStderr =
+      (state.lastStderr + chunk.toString('utf8'))
+        .slice(-3000);
   });
+
+  child.once('error', (error) => {
+
+    console.error('[YT-DLP PROCESS]', error);
+  });
+
+  child.once('close', (code) => {
+
+    if (state.process === child) {
+      state.process = null;
+    }
+
+    if (code !== 0 && code !== null) {
+
+      console.error(
+        '[YT-DLP EXIT]',
+        code,
+        state.lastStderr.slice(-1000)
+      );
+    }
+  });
+
+  return child;
+}
+
+// ========================================
+// تشغيل التالي من قائمة الانتظار
+// ========================================
+
+async function playNext(state) {
+
+  if (
+    state.preparing ||
+    state.player.state.status !== AudioPlayerStatus.Idle
+  ) {
+    return;
+  }
+
+  const track = state.queue.shift();
+
+  if (!track) {
+
+    state.current = null;
+
+    await refreshPanel(state);
+
+    return;
+  }
+
+  state.preparing = true;
+  state.current = track;
+
+  try {
+
+    const child = launchYtDlpStream(state, track);
+
+    const resource = createAudioResource(child.stdout, {
+
+      inputType: StreamType.Arbitrary,
+
+      metadata: track,
+
+    });
+
+    state.player.play(resource);
+
+    state.preparing = false;
+
+    await refreshPanel(state);
+
+  } catch (error) {
+
+    console.error('[PLAY NEXT]', error);
+
+    state.preparing = false;
+    state.current = null;
+
+    stopYtDlp(state);
+
+    await refreshPanel(state);
+
+    setTimeout(() => {
+      void playNext(state);
+    }, 1200).unref?.();
+  }
+}
+
+// ========================================
+// الاتصال بروم الصوت المحدد في index.js
+// ========================================
+
+async function ensureVoiceConnection(guild) {
+
+  const voiceChannel =
+    await client.channels.fetch(VOICE_CHANNEL_ID);
+
+  if (
+    !voiceChannel ||
+    !voiceChannel.isVoiceBased() ||
+    voiceChannel.type === ChannelType.GuildStageVoice
+  ) {
+
+    throw new Error(
+      'آيدي روم الصوت غير صحيح. استخدم روم صوت عادي وليس Stage.'
+    );
+  }
+
+  if (voiceChannel.guildId !== guild.id) {
+
+    throw new Error(
+      'روم الصوت المحدد ليس في هذا السيرفر.'
+    );
+  }
+
+  const permissions =
+    voiceChannel.permissionsFor(client.user);
+
+  if (
+    !permissions?.has(PermissionFlagsBits.Connect) ||
+    !permissions?.has(PermissionFlagsBits.Speak)
+  ) {
+
+    throw new Error(
+      'البوت يحتاج صلاحية Connect و Speak في روم الصوت.'
+    );
+  }
+
+  const state = getState(guild.id);
+
+  if (
+    !state.connection ||
+    state.connection.state.status === VoiceConnectionStatus.Destroyed
+  ) {
+
+    state.connection = joinVoiceChannel({
+
+      channelId: voiceChannel.id,
+
+      guildId: guild.id,
+
+      adapterCreator: guild.voiceAdapterCreator,
+
+      selfDeaf: true,
+      selfMute: false,
+
+    });
+
+    state.connection.subscribe(state.player);
+
+    state.connection.on('error', (error) => {
+      console.error('[VOICE CONNECTION]', error);
+    });
+  }
+
+  await entersState(
+    state.connection,
+    VoiceConnectionStatus.Ready,
+    25000
+  );
+
   return state;
 }
 
-function stopFfmpeg(state) {
-  const child = state.ffmpeg;
-  state.ffmpeg = null;
-  if (child && child.exitCode === null && !child.killed) child.kill('SIGTERM');
+// ========================================
+// التحقق من وجود المستخدم في روم الصوت
+// ========================================
+
+function requireUserInConfiguredVoice(interaction) {
+
+  const currentVoiceId =
+    interaction.guild?.voiceStates?.cache?.get(interaction.user.id)?.channelId;
+
+  return currentVoiceId === VOICE_CHANNEL_ID;
 }
 
-function queueDescription(state) {
-  const lines = [];
-  if (state.current) lines.push(`**يعمل الآن:** ${safeText(state.current.title)}`);
-  else lines.push('**لا يوجد مقطع يعمل حالياً.**');
-  if (state.queue.length) {
-    lines.push('', '**القائمة التالية:**');
-    state.queue.slice(0, 10).forEach((track, index) => lines.push(`${index + 1}. ${safeText(track.title)}`));
-    if (state.queue.length > 10) lines.push(`... و ${state.queue.length - 10} مقاطع أخرى`);
-  } else {
-    lines.push('', 'قائمة الانتظار فارغة.');
+// ========================================
+// تسجيل أوامر Slash
+// ========================================
+
+async function registerCommands(guild) {
+
+  const commands = [
+
+    new SlashCommandBuilder()
+      .setName('song')
+      .setDescription('اعرض الأغنية ثم أضفها إلى قائمة التشغيل')
+      .addStringOption(option =>
+        option
+          .setName('url')
+          .setDescription('رابط المقطع الصوتي')
+          .setRequired(true)
+      ),
+
+    new SlashCommandBuilder()
+      .setName('queue')
+      .setDescription('عرض قائمة التشغيل'),
+
+    new SlashCommandBuilder()
+      .setName('pause')
+      .setDescription('إيقاف الأغنية مؤقتاً'),
+
+    new SlashCommandBuilder()
+      .setName('resume')
+      .setDescription('استئناف الأغنية'),
+
+    new SlashCommandBuilder()
+      .setName('skip')
+      .setDescription('تخطي الأغنية الحالية'),
+
+    new SlashCommandBuilder()
+      .setName('stop')
+      .setDescription('إيقاف التشغيل ومسح القائمة'),
+
+  ];
+
+  const existing = await guild.commands.fetch();
+
+  for (const builder of commands) {
+
+    const data = builder.toJSON();
+
+    const old = existing.find(
+      command => command.name === data.name
+    );
+
+    if (old) {
+
+      await old.edit(data);
+
+    } else {
+
+      await guild.commands.create(data);
+    }
   }
-  return lines.join('\n').slice(0, 3900);
-}
 
-function makePanel(state) {
-  const paused = state.player.state.status === AudioPlayerStatus.Paused;
-  const embed = new EmbedBuilder()
-    .setColor(0x5865f2)
-    .setTitle('🎵 مشغل الموسيقى')
-    .setDescription(queueDescription(state))
-    .addFields(
-      { name: 'روم الصوت', value: `<#${state.voiceChannelId}>`, inline: true },
-      { name: 'عدد الانتظار', value: String(state.queue.length), inline: true },
-    )
-    .setFooter({ text: 'استخدم الأزرار للتحكم بالتشغيل' });
-
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('music:pause').setLabel('إيقاف مؤقت').setEmoji('⏸️').setStyle(ButtonStyle.Secondary).setDisabled(!state.current || paused),
-    new ButtonBuilder().setCustomId('music:resume').setLabel('استئناف').setEmoji('▶️').setStyle(ButtonStyle.Success).setDisabled(!paused),
-    new ButtonBuilder().setCustomId('music:skip').setLabel('تخطي').setEmoji('⏭️').setStyle(ButtonStyle.Primary).setDisabled(!state.current && state.queue.length === 0),
-    new ButtonBuilder().setCustomId('music:stop').setLabel('إيقاف ومسح').setEmoji('⏹️').setStyle(ButtonStyle.Danger).setDisabled(!state.current && state.queue.length === 0),
+  console.log(
+    `[SLASH COMMANDS] Registered in ${guild.name}`
   );
-  return { embeds: [embed], components: [row], allowedMentions: { parse: [] } };
 }
 
-async function refreshPanels(state) {
-  const payload = makePanel(state);
-  for (const [id, message] of state.panels) {
-    try { await message.edit(payload); }
-    catch (error) {
-      if ([10008, 10003, 50001, 50013].includes(error.code)) state.panels.delete(id);
-      else console.warn('Could not update a music panel:', error.message);
-    }
+// ========================================
+// رسائل الأخطاء
+// ========================================
+
+async function replyError(interaction, message) {
+
+  const payload = {
+    content: `⚠️ ${message}`,
+    ephemeral: true,
+  };
+
+  if (interaction.deferred || interaction.replied) {
+
+    return interaction.followUp(payload).catch(() => {});
   }
+
+  return interaction.reply(payload).catch(() => {});
 }
 
-async function playNext(state) {
-  if (state.advancing || state.player.state.status !== AudioPlayerStatus.Idle) return;
-  state.advancing = true;
+// ========================================
+// أمر /song
+// ========================================
+
+async function handleSongCommand(interaction) {
+
+  if (!requireUserInConfiguredVoice(interaction)) {
+
+    return replyError(
+      interaction,
+      'ادخل روم الصوت المحدد في أعلى index.js أولاً.'
+    );
+  }
+
+  await interaction.deferReply();
+
   try {
-    while (state.queue.length && state.player.state.status === AudioPlayerStatus.Idle) {
-      const track = state.queue.shift();
-      let child;
-      try {
-        child = spawn(ffmpegPath, [
-          '-nostdin', '-hide_banner', '-loglevel', 'error',
-          '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
-          '-i', track.url, '-vn', '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1',
-        ], { stdio: ['ignore', 'pipe', 'pipe'] });
-        state.ffmpeg = child;
-        let stderr = '';
-        child.stderr.on('data', chunk => { if (stderr.length < 3000) stderr += chunk.toString(); });
-        child.once('error', error => {
-          console.error('FFmpeg failed:', error);
-          if (state.current?.id === track.id) state.player.stop(true);
-        });
-        child.once('close', code => {
-          if (code && code !== 255) console.error(`FFmpeg exit ${code}: ${stderr.slice(0, 1000)}`);
-        });
-        const resource = createAudioResource(child.stdout, { inputType: StreamType.Raw, inlineVolume: true, metadata: track });
-        resource.volume?.setVolume(DEFAULT_VOLUME);
-        state.current = track;
-        state.player.play(resource);
-        console.log(`Now playing: ${track.title}`);
-        break;
-      } catch (error) {
-        if (child && child.exitCode === null && !child.killed) child.kill('SIGTERM');
-        state.ffmpeg = null;
-        state.current = null;
-        console.error(`Could not play ${track.title}:`, error);
-      }
+
+    const state =
+      await ensureVoiceConnection(interaction.guild);
+
+    const rawUrl =
+      interaction.options.getString('url', true);
+
+    const track = await getTrackInfo(
+      rawUrl,
+      interaction.user.id
+    );
+
+    if (state.queue.length >= MAX_QUEUE) {
+
+      return interaction.editReply(
+        `القائمة ممتلئة. الحد الأقصى ${MAX_QUEUE} أغنية.`
+      );
     }
-  } finally {
-    state.advancing = false;
+
+    const previewId =
+      randomUUID().replaceAll('-', '').slice(0, 24);
+
+    previews.set(previewId, {
+      track,
+      guildId: interaction.guildId,
+    });
+
+    const cleanupTimer = setTimeout(() => {
+      previews.delete(previewId);
+    }, PREVIEW_TTL_MS);
+
+    cleanupTimer.unref?.();
+
+    const row = new ActionRowBuilder().addComponents(
+
+      new ButtonBuilder()
+        .setCustomId(`song:add:${previewId}`)
+        .setLabel('إضافة إلى قائمة التشغيل')
+        .setEmoji('➕')
+        .setStyle(ButtonStyle.Success),
+
+      new ButtonBuilder()
+        .setCustomId(`song:cancel:${previewId}`)
+        .setLabel('إلغاء')
+        .setStyle(ButtonStyle.Secondary),
+
+    );
+
+    await interaction.editReply({
+
+      embeds: [
+        buildTrackEmbed(track, 'جاهزة للإضافة'),
+      ],
+
+      components: [row],
+
+    });
+
+  } catch (error) {
+
+    console.error('[SONG COMMAND]', error);
+
+    const message =
+      /not a bot|Unsupported URL|No video|private|unavailable|not available/i.test(error.message)
+        ? 'المقطع غير متاح أو الرابط غير مدعوم حالياً. جرّب رابطاً عاماً آخر.'
+        : `تعذر جلب بيانات المقطع: ${cleanText(error.message, 300)}`;
+
+    await interaction.editReply({
+
+      content: `⚠️ ${message}`,
+
+      embeds: [],
+      components: [],
+
+    }).catch(() => {});
   }
-  await refreshPanels(state);
 }
 
-async function connectVoice(guild, voiceChannel) {
-  const existing = getVoiceConnection(guild.id);
-  if (existing && existing.state.status !== VoiceConnectionStatus.Destroyed) {
-    existing.destroy();
+// ========================================
+// التعامل مع الأزرار
+// ========================================
+
+async function handleButton(interaction) {
+
+  const [scope, action, id] =
+    interaction.customId.split(':');
+
+  // إلغاء معاينة الأغنية
+  if (scope === 'song' && action === 'cancel') {
+
+    previews.delete(id);
+
+    return interaction.update({
+
+      content: 'تم إلغاء طلب الأغنية.',
+
+      embeds: [],
+      components: [],
+
+    });
   }
-  const connection = joinVoiceChannel({
-    channelId: voiceChannel.id,
-    guildId: guild.id,
-    adapterCreator: guild.voiceAdapterCreator,
-    selfDeaf: true,
-    selfMute: false,
-  });
-  music.connection = connection;
-  connection.subscribe(music.player);
-  connection.on('stateChange', (oldState, newState) => {
-    if (newState.status === VoiceConnectionStatus.Disconnected) {
-      void Promise.race([
-        entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-        entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
-      ]).catch(() => {
-        if (connection.state.status !== VoiceConnectionStatus.Destroyed) connection.destroy();
-      });
+
+  // إضافة الأغنية إلى القائمة
+  if (scope === 'song' && action === 'add') {
+
+    const preview = previews.get(id);
+
+    if (
+      !preview ||
+      preview.guildId !== interaction.guildId
+    ) {
+
+      return replyError(
+        interaction,
+        'انتهت صلاحية معاينة الأغنية. استخدم /song من جديد.'
+      );
     }
-  });
-  await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
-  console.log(`Connected to voice channel ${voiceChannel.name} (${voiceChannel.id})`);
-}
 
-const commands = [
-  new SlashCommandBuilder()
-    .setName('song')
-    .setDescription('إضافة مقطع صوتي إلى قائمة التشغيل')
-    .addStringOption(option => option.setName('url').setDescription('رابط ملف صوتي مباشر').setRequired(true))
-    .addStringOption(option => option.setName('title').setDescription('اسم اختياري للمقطع').setRequired(false)),
-  new SlashCommandBuilder().setName('queue').setDescription('عرض قائمة التشغيل'),
-  new SlashCommandBuilder().setName('pause').setDescription('إيقاف المقطع مؤقتاً'),
-  new SlashCommandBuilder().setName('resume').setDescription('استئناف المقطع'),
-  new SlashCommandBuilder().setName('skip').setDescription('تخطي المقطع الحالي'),
-  new SlashCommandBuilder().setName('stop').setDescription('إيقاف التشغيل ومسح القائمة'),
-].map(command => command.toJSON());
+    if (!requireUserInConfiguredVoice(interaction)) {
 
-async function registerCommands(guildId) {
-  const rest = new REST({ version: '10' }).setToken(TOKEN);
-  await rest.put(Routes.applicationGuildCommands(client.user.id, guildId), { body: commands });
-  console.log(`Registered music slash commands in guild ${guildId}`);
-}
-
-async function handleCommand(interaction) {
-  if (interaction.isButton()) {
-    if (!music || interaction.guildId !== music.guildId) {
-      await interaction.reply({ content: 'البوت غير مهيأ لهذا السيرفر.', ephemeral: true });
-      return;
+      return replyError(
+        interaction,
+        'ادخل روم الصوت المحدد أولاً.'
+      );
     }
+
+    const state = getState(interaction.guildId);
+
+    if (state.queue.length >= MAX_QUEUE) {
+
+      return replyError(
+        interaction,
+        `القائمة ممتلئة. الحد الأقصى ${MAX_QUEUE} أغنية.`
+      );
+    }
+
+    previews.delete(id);
+
+    const track = {
+      ...preview.track,
+      requesterId: interaction.user.id,
+    };
+
+    state.queue.push(track);
+
+    // لوحة التحكم تظهر في نفس الشات الذي استخدم فيه /song
+    state.panelMessage = interaction.message;
+
+    await interaction.update({
+
+      embeds: [
+        buildTrackEmbed(track, 'تمت إضافتها إلى القائمة'),
+      ],
+
+      components: [
+        controlRow(state),
+      ],
+
+    });
+
     try {
-      switch (interaction.customId) {
-        case 'music:pause':
-          if (!music.current || music.player.state.status === AudioPlayerStatus.Paused || !music.player.pause()) {
-            throw new Error('لا يوجد مقطع يعمل لإيقافه مؤقتاً.');
-          }
-          break;
-        case 'music:resume':
-          if (music.player.state.status !== AudioPlayerStatus.Paused || !music.player.unpause()) {
-            throw new Error('لا يوجد مقطع متوقف مؤقتاً لاستئنافه.');
-          }
-          break;
-        case 'music:skip':
-          if (!music.current && !music.queue.length) throw new Error('قائمة التشغيل فارغة.');
-          music.player.stop(true);
-          break;
-        case 'music:stop':
-          music.queue.length = 0;
-          music.current = null;
-          stopFfmpeg(music);
-          music.player.stop(true);
-          break;
-        default:
-          throw new Error('هذا الزر غير معروف.');
-      }
-      await refreshPanels(music);
-      await interaction.reply({ content: 'تم تنفيذ التحكم وتحديث القائمة.', ephemeral: true });
+
+      await ensureVoiceConnection(interaction.guild);
+
+      await playNext(state);
+
     } catch (error) {
-      await interaction.reply({ content: `⚠️ ${error.message}`.slice(0, 1900), ephemeral: true }).catch(() => {});
+
+      console.error('[QUEUE / VOICE]', error);
+
+      await interaction.followUp({
+
+        content:
+          `⚠️ تمت إضافة الأغنية، لكن تعذر الاتصال بالروم: ${cleanText(error.message, 250)}`,
+
+        ephemeral: true,
+
+      }).catch(() => {});
     }
+
     return;
   }
 
-  if (!interaction.isChatInputCommand()) return;
-  if (!music || interaction.guildId !== music.guildId) {
-    await interaction.reply({ content: 'البوت غير مهيأ لهذا السيرفر.', ephemeral: true });
+  if (scope !== 'music') return;
+
+  if (
+    !interaction.guild ||
+    interaction.guildId !== configuredGuildId
+  ) {
+
+    return replyError(
+      interaction,
+      'هذا التحكم متاح في السيرفر المحدد فقط.'
+    );
+  }
+
+  if (!requireUserInConfiguredVoice(interaction)) {
+
+    return replyError(
+      interaction,
+      'ادخل روم الصوت المحدد للتحكم بالتشغيل.'
+    );
+  }
+
+  const state = getState(interaction.guildId);
+
+  // إيقاف مؤقت / استئناف
+  if (action === 'toggle') {
+
+    if (
+      state.player.state.status === AudioPlayerStatus.Paused
+    ) {
+
+      state.player.unpause();
+
+    } else if (
+      state.player.state.status === AudioPlayerStatus.Playing
+    ) {
+
+      state.player.pause();
+
+    } else {
+
+      return replyError(
+        interaction,
+        'ما فيه أغنية تعمل حالياً.'
+      );
+    }
+
+    state.panelMessage = interaction.message;
+
+    await interaction.update({
+
+      embeds: [
+        state.current
+          ? buildTrackEmbed(
+              state.current,
+              state.player.state.status === AudioPlayerStatus.Paused
+                ? 'متوقفة مؤقتاً'
+                : 'قيد التشغيل'
+            )
+          : buildQueueEmbed(state),
+      ],
+
+      components: [
+        controlRow(state),
+      ],
+
+    });
+
     return;
   }
 
-  const name = interaction.commandName;
-  try {
-    if (name === 'song') {
-      const rawUrl = interaction.options.getString('url', true).trim();
-      const url = validateAudioUrl(rawUrl);
-      const title = getTrackTitle(url, interaction.options.getString('title'));
-      await interaction.deferReply();
-      if (!music.connection || music.connection.state.status !== VoiceConnectionStatus.Ready) {
-        await connectVoice(music.guild, await music.guild.channels.fetch(VOICE_CHANNEL_ID));
-      }
-      if (music.queue.length >= MAX_QUEUE_SIZE) throw new Error(`قائمة الانتظار ممتلئة (الحد ${MAX_QUEUE_SIZE} مقطع).`);
-      const track = {
-        id: randomUUID(),
-        url,
-        title,
-        requestedBy: safeText(interaction.user.username),
-      };
-      const startsNow = !music.current && music.player.state.status === AudioPlayerStatus.Idle;
-      music.queue.push(track);
-      if (startsNow) await playNext(music);
-      const response = makePanel(music);
-      response.content = startsNow ? `✅ تمت إضافة **${title}** وبدأ تشغيله.` : `✅ تمت إضافة **${title}** إلى قائمة الانتظار.`;
-      await interaction.editReply(response);
-      const replyMessage = await interaction.fetchReply();
-      music.panels.set(replyMessage.id, replyMessage);
-      while (music.panels.size > MAX_PANELS) music.panels.delete(music.panels.keys().next().value);
-      await refreshPanels(music);
-      return;
+  // تخطي
+  if (action === 'skip') {
+
+    if (!state.current) {
+
+      return replyError(
+        interaction,
+        'ما فيه أغنية لتخطيها.'
+      );
     }
 
-    if (name === 'queue') {
-      await interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('📃 قائمة التشغيل').setDescription(queueDescription(music))], ephemeral: true });
-      return;
+    state.panelMessage = interaction.message;
+
+    stopYtDlp(state);
+
+    state.current = null;
+    state.preparing = false;
+
+    if (
+      state.player.state.status !== AudioPlayerStatus.Idle
+    ) {
+
+      state.player.stop(true);
+
+    } else {
+
+      void playNext(state);
     }
 
-    if (name === 'pause') {
-      if (!music.current) throw new Error('ما فيه مقطع يعمل حالياً.');
-      if (!music.player.pause()) throw new Error('تعذر إيقاف المقطع مؤقتاً.');
-    } else if (name === 'resume') {
-      if (music.player.state.status !== AudioPlayerStatus.Paused || !music.player.unpause()) throw new Error('ما فيه مقطع متوقف مؤقتاً.');
-    } else if (name === 'skip') {
-      if (!music.current && !music.queue.length) throw new Error('قائمة التشغيل فارغة.');
-      music.player.stop(true);
-    } else if (name === 'stop') {
-      music.queue.length = 0;
-      music.current = null;
-      stopFfmpeg(music);
-      music.player.stop(true);
+    await interaction.reply({
+
+      content: '⏭️ تم تخطي الأغنية.',
+
+      ephemeral: true,
+
+    });
+
+    return;
+  }
+
+  // إيقاف ومسح القائمة
+  if (action === 'stop') {
+
+    state.panelMessage = interaction.message;
+
+    state.queue = [];
+    state.current = null;
+    state.preparing = false;
+
+    stopYtDlp(state);
+
+    if (
+      state.player.state.status !== AudioPlayerStatus.Idle
+    ) {
+
+      state.player.stop(true);
     }
 
-    await refreshPanels(music);
-    await interaction.reply({ content: 'تم تنفيذ الأمر وتحديث قائمة التشغيل في رسالة الأغنية.', ephemeral: true });
-  } catch (error) {
-    const message = `⚠️ ${error.message || 'حدث خطأ غير متوقع.'}`.slice(0, 1900);
-    if (interaction.deferred || interaction.replied) await interaction.followUp({ content: message, ephemeral: true }).catch(() => {});
-    else await interaction.reply({ content: message, ephemeral: true }).catch(() => {});
+    await interaction.reply({
+
+      content: '⏹️ تم إيقاف التشغيل ومسح القائمة.',
+
+      ephemeral: true,
+
+    });
+
+    await refreshPanel(state);
+
+    return;
+  }
+
+  // عرض القائمة
+  if (action === 'queue') {
+
+    return interaction.reply({
+
+      embeds: [
+        buildQueueEmbed(state),
+      ],
+
+      ephemeral: true,
+
+    });
   }
 }
 
-client.once(Events.ClientReady, async readyClient => {
-  console.log(`Logged in as ${readyClient.user.tag}`);
+// ========================================
+// أوامر Slash الإضافية
+// ========================================
+
+async function handleSlashCommand(interaction) {
+
+  if (interaction.guildId !== configuredGuildId) {
+
+    return replyError(
+      interaction,
+      'البوت مضبوط على سيرفر واحد وروم صوت واحد.'
+    );
+  }
+
+  if (!requireUserInConfiguredVoice(interaction)) {
+
+    return replyError(
+      interaction,
+      'ادخل روم الصوت المحدد في أعلى index.js أولاً.'
+    );
+  }
+
+  if (interaction.commandName === 'song') {
+
+    return handleSongCommand(interaction);
+  }
+
+  const state =
+    await ensureVoiceConnection(interaction.guild);
+
+  if (interaction.commandName === 'queue') {
+
+    return interaction.reply({
+
+      embeds: [
+        buildQueueEmbed(state),
+      ],
+
+      ephemeral: true,
+
+    });
+  }
+
+  if (interaction.commandName === 'pause') {
+
+    if (
+      state.player.state.status !== AudioPlayerStatus.Playing
+    ) {
+
+      return replyError(
+        interaction,
+        'ما فيه أغنية تعمل حالياً.'
+      );
+    }
+
+    state.player.pause();
+
+    await interaction.reply({
+
+      content: '⏸️ تم الإيقاف المؤقت.',
+
+      ephemeral: true,
+
+    });
+
+    await refreshPanel(state);
+
+    return;
+  }
+
+  if (interaction.commandName === 'resume') {
+
+    if (
+      state.player.state.status !== AudioPlayerStatus.Paused
+    ) {
+
+      return replyError(
+        interaction,
+        'الأغنية ليست متوقفة مؤقتاً.'
+      );
+    }
+
+    state.player.unpause();
+
+    await interaction.reply({
+
+      content: '▶️ تم استئناف التشغيل.',
+
+      ephemeral: true,
+
+    });
+
+    await refreshPanel(state);
+
+    return;
+  }
+
+  if (interaction.commandName === 'skip') {
+
+    if (!state.current) {
+
+      return replyError(
+        interaction,
+        'ما فيه أغنية لتخطيها.'
+      );
+    }
+
+    stopYtDlp(state);
+
+    state.current = null;
+    state.preparing = false;
+
+    if (
+      state.player.state.status !== AudioPlayerStatus.Idle
+    ) {
+
+      state.player.stop(true);
+
+    } else {
+
+      void playNext(state);
+    }
+
+    return interaction.reply({
+
+      content: '⏭️ تم تخطي الأغنية.',
+
+      ephemeral: true,
+
+    });
+  }
+
+  if (interaction.commandName === 'stop') {
+
+    state.queue = [];
+    state.current = null;
+    state.preparing = false;
+
+    stopYtDlp(state);
+
+    if (
+      state.player.state.status !== AudioPlayerStatus.Idle
+    ) {
+
+      state.player.stop(true);
+    }
+
+    await interaction.reply({
+
+      content: '⏹️ تم إيقاف التشغيل ومسح القائمة.',
+
+      ephemeral: true,
+
+    });
+
+    await refreshPanel(state);
+  }
+}
+
+// ========================================
+// استقبال التفاعلات
+// ========================================
+
+client.on(Events.InteractionCreate, async (interaction) => {
+
   try {
-    const voiceChannel = await client.channels.fetch(VOICE_CHANNEL_ID);
-    if (!voiceChannel?.isVoiceBased() || !voiceChannel.guild) throw new Error('آيدي روم الصوت لا يشير إلى روم صوتي صالح.');
-    music = createMusicState(voiceChannel.guild, voiceChannel);
-    await connectVoice(voiceChannel.guild, voiceChannel);
-    await registerCommands(voiceChannel.guild.id);
-    ready = true;
-    console.log('Music bot is ready. Run /song in any text channel in this server.');
+
+    if (interaction.isChatInputCommand()) {
+
+      await handleSlashCommand(interaction);
+
+    } else if (interaction.isButton()) {
+
+      await handleButton(interaction);
+    }
+
   } catch (error) {
-    console.error('Bot setup failed:', error);
-    ready = false;
+
+    console.error('[INTERACTION ERROR]', error);
+
+    await replyError(
+      interaction,
+      'صار خطأ غير متوقع. راجع Logs في Render.'
+    );
   }
 });
 
-client.on(Events.InteractionCreate, interaction => { void handleCommand(interaction); });
+// ========================================
+// تشغيل البوت
+// ========================================
+
+client.once(Events.ClientReady, async (readyClient) => {
+
+  console.log(
+    `[DISCORD READY] Logged in as ${readyClient.user.tag}`
+  );
+
+  try {
+
+    const voiceChannel =
+      await client.channels.fetch(VOICE_CHANNEL_ID);
+
+    if (!voiceChannel?.guild) {
+
+      throw new Error(
+        'لم أجد روم الصوت. تأكد من آيدي الروم وأن البوت موجود بالسيرفر.'
+      );
+    }
+
+    configuredGuildId = voiceChannel.guild.id;
+
+    await registerCommands(voiceChannel.guild);
+
+    await ensureVoiceConnection(voiceChannel.guild);
+
+    console.log(
+      `[VOICE READY] Connected to ${voiceChannel.name}`
+    );
+
+  } catch (error) {
+
+    console.error(
+      '[STARTUP VOICE/COMMANDS]',
+      error
+    );
+  }
+});
+
+// ========================================
+// Render Web Service
+// ========================================
+
+const server = createServer((req, res) => {
+
+  if (req.url === '/health' || req.url === '/') {
+
+    const body = JSON.stringify({
+
+      status: client.isReady() ? 'ok' : 'starting',
+
+      discord: client.isReady(),
+
+      voiceChannelConfigured:
+        VOICE_CHANNEL_ID !== 'PUT_VOICE_CHANNEL_ID_HERE',
+
+    });
+
+    res.writeHead(
+      client.isReady() ? 200 : 503,
+      {
+        'content-type': 'application/json; charset=utf-8',
+
+        'content-length': Buffer.byteLength(body),
+      }
+    );
+
+    res.end(body);
+
+    return;
+  }
+
+  res.writeHead(404, {
+    'content-type': 'text/plain; charset=utf-8',
+  });
+
+  res.end('Not Found');
+});
+
+server.listen(PORT, '0.0.0.0', () => {
+
+  console.log(
+    `[HTTP READY] Listening on 0.0.0.0:${PORT}`
+  );
+});
+
+// ========================================
+// معالجة إغلاق الخدمة والأخطاء
+// ========================================
+
+process.on('unhandledRejection', (error) => {
+
+  console.error(
+    '[UNHANDLED REJECTION]',
+    error
+  );
+});
+
+process.on('uncaughtException', (error) => {
+
+  console.error(
+    '[UNCAUGHT EXCEPTION]',
+    error
+  );
+
+  process.exit(1);
+});
 
 async function shutdown(signal) {
-  console.log(`Received ${signal}; shutting down.`);
-  ready = false;
-  if (music) {
-    music.queue.length = 0;
-    stopFfmpeg(music);
-    music.player.stop(true);
-    music.connection?.destroy();
+
+  console.log(`[SHUTDOWN] ${signal}`);
+
+  for (const state of states.values()) {
+
+    state.queue = [];
+
+    stopYtDlp(state);
+
+    try {
+      state.player.stop(true);
+    } catch {}
+
+    try {
+      state.connection?.destroy();
+    } catch {}
   }
+
   server.close();
+
   client.destroy();
+
   process.exit(0);
 }
-process.once('SIGINT', () => { void shutdown('SIGINT'); });
-process.once('SIGTERM', () => { void shutdown('SIGTERM'); });
 
-client.login(TOKEN).catch(error => {
-  console.error('Discord login failed:', error);
-  process.exitCode = 1;
+process.once('SIGINT', () => {
+  void shutdown('SIGINT');
+});
+
+process.once('SIGTERM', () => {
+  void shutdown('SIGTERM');
+});
+
+// تسجيل الدخول
+client.login(TOKEN).catch((error) => {
+
+  console.error(
+    '[DISCORD LOGIN FAILED]',
+    error
+  );
+
+  process.exit(1);
 });
